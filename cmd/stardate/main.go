@@ -16,18 +16,11 @@ import (
 func main() {
 	httpsAddr := flag.String("https", ":8443", "HTTPS server listen address")
 	httpAddr := flag.String("http", "", "HTTP server listen address for testing (e.g. --http=localhost:8080)")
-	pw := flag.String("pw", "", "Shared password for Basic authentication (e.g. --pw=XXX)")
-	pwFile := flag.String("pwfile", "", "Path to JSONL password file (e.g. --pwfile=FILEPATH.jsonl)")
-	salt := flag.String("salt", "", "Salt for deriving crypto username and password hashes (e.g. --salt=\"some-arbitrary-string\")")
-	dataFile := flag.String("data", "messages.json", "Path to JSON file for persisting messages (empty for in-memory only)")
+	dir := flag.String("dir", ".", "Base directory containing per-site subdirectories (<dir>/<site>/{config.json,pwfile.jsonl,messages.json})")
 	certFile := flag.String("cert", "", "Path to TLS certificate file (if empty or not found, self-signed certificate is generated)")
 	keyFile := flag.String("key", "", "Path to TLS private key file")
 	hostsFlag := flag.String("hosts", "localhost,127.0.0.1,::1", "Comma-separated hostnames and IPs for self-signed certificate")
 	flag.Parse()
-
-	if *pw == "" && *pwFile == "" {
-		log.Println("Notice: neither --pw nor --pwfile is set. Basic authentication logins will be disabled.")
-	}
 
 	var hosts []string
 	for _, h := range strings.Split(*hostsFlag, ",") {
@@ -37,14 +30,11 @@ func main() {
 		}
 	}
 
-	cfg := server.Config{
+	cfg := server.ServerConfig{
 		Addr:      *httpsAddr,
 		HTTPSAddr: *httpsAddr,
 		HTTPAddr:  *httpAddr,
-		Password:  *pw,
-		PWFile:    *pwFile,
-		Salt:      *salt,
-		DataFile:  *dataFile,
+		Dir:       *dir,
 		CertFile:  *certFile,
 		KeyFile:   *keyFile,
 		Hosts:     hosts,

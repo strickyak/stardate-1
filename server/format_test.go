@@ -46,10 +46,14 @@ func TestRenderAndSanitize(t *testing.T) {
 
 func TestServerMarkdownAndQuillIntegration(t *testing.T) {
 	const sharedPW = "quill-test-pw"
-	srv, err := New(Config{
+	srv, err := New(ServerConfig{
 		HTTPAddr: "127.0.0.1:0",
-		Password: sharedPW,
-		Salt:     "quill-salt",
+		Sites: map[string]SiteConfig{
+			"127.0.0.1": {
+				Password: sharedPW,
+				Salt:     "quill-salt",
+			},
+		},
 	})
 	if err != nil {
 		t.Fatalf("failed to create server: %v", err)

@@ -1,11 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -32,8 +34,9 @@ func TestCalculateStardate(t *testing.T) {
 }
 
 func TestPasswordPrefixAuth(t *testing.T) {
-	srv := &Server{
-		cfg: Config{
+	site := &Site{
+		handle: "localhost",
+		cfg: SiteConfig{
 			Password: "starfleet",
 			Salt:     "some-arbitrary-string",
 		},
@@ -119,9 +122,9 @@ func TestPasswordPrefixAuth(t *testing.T) {
 			if tc.username != "" || tc.password != "" {
 				req.SetBasicAuth(tc.username, tc.password)
 			}
-			auth, ok := srv.authenticate(req)
+			auth, ok := site.Authenticate(req)
 			if ok != tc.wantAuth {
-				t.Fatalf("authenticate() ok = %v, want %v", ok, tc.wantAuth)
+				t.Fatalf("Authenticate() ok = %v, want %v", ok, tc.wantAuth)
 			}
 			if tc.wantAuth {
 				if auth.IsCrypto != tc.wantCrypto {
@@ -131,7 +134,7 @@ func TestPasswordPrefixAuth(t *testing.T) {
 					t.Errorf("auth.EffectiveUser = %s, want %s", auth.EffectiveUser, tc.wantUser)
 				}
 				if tc.wantCrypto {
-					expectedCrypto, _ := DeriveCryptoIdentity(srv.cfg.Salt, tc.username, tc.password)
+					expectedCrypto, _ := DeriveCryptoIdentity(site.cfg.Salt, tc.username, tc.password)
 					if auth.EffectiveUser != expectedCrypto {
 						t.Errorf("auth.EffectiveUser = %s, want %s", auth.EffectiveUser, expectedCrypto)
 					}
@@ -144,10 +147,14 @@ func TestPasswordPrefixAuth(t *testing.T) {
 func TestServerHTTPSAndMicroblog(t *testing.T) {
 	const sharedPW = "stardate-secret-pw"
 	const testSalt = "some-arbitrary-string"
-	cfg := Config{
-		Addr:     "127.0.0.1:0", // random available port
-		Password: sharedPW,
-		Salt:     testSalt,
+	cfg := ServerConfig{
+		Addr: "127.0.0.1:0", // random available port
+		Sites: map[string]SiteConfig{
+			"127.0.0.1": {
+				Password: sharedPW,
+				Salt:     testSalt,
+			},
+		},
 	}
 
 	srv, err := New(cfg)
@@ -316,7 +323,7 @@ func TestServerHTTPSAndMicroblog(t *testing.T) {
 	}
 
 	// 9. Inspect raw stored message in store to verify encryption and Base64 representation
-	recentRaw := srv.Store().GetRecent(expectedCryptoUser, 10)
+	recentRaw := srv.Site("127.0.0.1").Store().GetRecent(expectedCryptoUser, 10)
 	var spockRawMsg *Message
 	for _, m := range recentRaw {
 		if m.Author == expectedCryptoUser && !m.IsPublic {
@@ -492,10 +499,14 @@ func TestServerHTTPSAndMicroblog(t *testing.T) {
 
 func TestServerHTTPPort(t *testing.T) {
 	const sharedPW = "http-test-pw"
-	cfg := Config{
+	cfg := ServerConfig{
 		HTTPSAddr: "127.0.0.1:0",
 		HTTPAddr:  "127.0.0.1:0",
-		Password:  sharedPW,
+		Sites: map[string]SiteConfig{
+			"127.0.0.1": {
+				Password: sharedPW,
+			},
+		},
 	}
 
 	srv, err := New(cfg)
@@ -538,8 +549,9 @@ func TestServerHTTPPort(t *testing.T) {
 func TestPWFileAuthentication(t *testing.T) {
 	testDir := filepath.Join(".", ".test_tmp")
 	_ = os.RemoveAll(testDir)
-	if err := os.MkdirAll(testDir, 0755); err != nil {
-		t.Fatalf("failed to create test dir: %v", err)
+	siteDir := filepath.Join(testDir, "yak.net")
+	if err := os.MkdirAll(siteDir, 0755); err != nil {
+		t.Fatalf("failed to create site dir: %v", err)
 	}
 	defer os.RemoveAll(testDir)
 
@@ -547,7 +559,12 @@ func TestPWFileAuthentication(t *testing.T) {
 	kirkPW := "kobayashi"
 	kirkHash := HashPassword(testSalt, kirkPW)
 
-	pwFilePath := filepath.Join(testDir, "users.jsonl")
+	cfgBytes := []byte(`{"salt": "federation-salt"}` + "\n")
+	if err := os.WriteFile(filepath.Join(siteDir, SiteConfigFilename), cfgBytes, 0600); err != nil {
+		t.Fatalf("failed to write config.json: %v", err)
+	}
+
+	pwFilePath := filepath.Join(siteDir, SitePWFilename)
 	jsonlContent := strings.Join([]string{
 		`{"handle": "Spock_01", "display": "Spock 🖖", "pw": "llap"}`,
 		`{"handle": "Kirk", "pwhash": "` + kirkHash + `"}`,
@@ -557,15 +574,17 @@ func TestPWFileAuthentication(t *testing.T) {
 		t.Fatalf("failed to write pwfile: %v", err)
 	}
 
-	// Note: Password (--pw) is empty, so shared password logins are disabled
-	srv, err := New(Config{
+	// Note: pw is empty in config.json, so shared password logins are disabled
+	srv, err := New(ServerConfig{
 		HTTPAddr: "127.0.0.1:0",
-		PWFile:   pwFilePath,
-		Salt:     testSalt,
-		DataFile: "",
+		Dir:      testDir,
 	})
 	if err != nil {
-		t.Fatalf("New() with valid pwfile failed: %v", err)
+		t.Fatalf("New() with valid site pwfile.jsonl failed: %v", err)
+	}
+	site := srv.Site("yak.net")
+	if site == nil {
+		t.Fatalf("expected site yak.net to be loaded")
 	}
 
 	tests := []struct {
@@ -624,7 +643,7 @@ func TestPWFileAuthentication(t *testing.T) {
 			wantAuth: false,
 		},
 		{
-			name:     "unknown user rejected when --pw is empty",
+			name:     "unknown user rejected when pw is empty",
 			username: "mccoy",
 			password: "llap",
 			wantAuth: false,
@@ -633,11 +652,11 @@ func TestPWFileAuthentication(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			req, _ := http.NewRequest(http.MethodGet, "http://localhost/", nil)
+			req, _ := http.NewRequest(http.MethodGet, "http://yak.net/", nil)
 			req.SetBasicAuth(tc.username, tc.password)
-			auth, ok := srv.authenticate(req)
+			auth, ok := site.Authenticate(req)
 			if ok != tc.wantAuth {
-				t.Fatalf("authenticate() ok = %v, want %v", ok, tc.wantAuth)
+				t.Fatalf("Authenticate() ok = %v, want %v", ok, tc.wantAuth)
 			}
 			if !tc.wantAuth {
 				return
@@ -661,14 +680,726 @@ func TestPWFileAuthentication(t *testing.T) {
 		})
 	}
 
-	// Verify invalid handle in pwfile is rejected on load
-	badPWFile := filepath.Join(testDir, "bad_users.jsonl")
-	if err := os.WriteFile(badPWFile, []byte(`{"handle": "bad-handle!", "pw": "secret"}`+"\n"), 0600); err != nil {
+	// Verify invalid handle in pwfile.jsonl is rejected on load
+	badSiteDir := filepath.Join(testDir, "bad.yak.net")
+	_ = os.MkdirAll(badSiteDir, 0755)
+	_ = os.WriteFile(filepath.Join(badSiteDir, SiteConfigFilename), []byte(`{}`), 0600)
+	if err := os.WriteFile(filepath.Join(badSiteDir, SitePWFilename), []byte(`{"handle": "bad-handle!", "pw": "secret"}`+"\n"), 0600); err != nil {
 		t.Fatalf("failed to write bad pwfile: %v", err)
 	}
-	if _, err := New(Config{HTTPAddr: "127.0.0.1:0", PWFile: badPWFile}); err == nil {
-		t.Errorf("expected error loading pwfile with invalid handle 'bad-handle!', got nil")
+	if _, err := New(ServerConfig{HTTPAddr: "127.0.0.1:0", Dir: testDir}); err == nil {
+		t.Errorf("expected error loading site pwfile.jsonl with invalid handle 'bad-handle!', got nil")
 	}
 }
 
+func TestSuperuserFeatures(t *testing.T) {
+	testDir := filepath.Join(".", ".test_tmp_su")
+	_ = os.RemoveAll(testDir)
+	siteDir := filepath.Join(testDir, "127.0.0.1")
+	if err := os.MkdirAll(siteDir, 0755); err != nil {
+		t.Fatalf("failed to create site dir: %v", err)
+	}
+	defer os.RemoveAll(testDir)
+
+	cfgPath := filepath.Join(siteDir, SiteConfigFilename)
+	pwFilePath := filepath.Join(siteDir, SitePWFilename)
+	dataFilePath := filepath.Join(siteDir, DirMicrologs, "1.json")
+
+	if err := os.WriteFile(cfgPath, []byte(`{"salt":"enterprise-d"}`+"\n"), 0600); err != nil {
+		t.Fatalf("failed to write config.json: %v", err)
+	}
+
+	jsonlContent := strings.Join([]string{
+		`{"handle":"picard","display":"Capt. Picard","pw":"engage","superuser":true}`,
+		`{"handle":"riker","display":"Cmdr. Riker","pw":"number1"}`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(pwFilePath, []byte(jsonlContent), 0600); err != nil {
+		t.Fatalf("failed to write pwfile: %v", err)
+	}
+
+	srv, err := New(ServerConfig{
+		HTTPAddr: "127.0.0.1:0",
+		Dir:      testDir,
+	})
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	go func() {
+		_ = srv.Start()
+	}()
+	for i := 0; i < 50; i++ {
+		if srv.httpListener != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if srv.httpListener == nil {
+		t.Fatal("timed out waiting for HTTP listener")
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	}()
+
+	baseURL := "http://" + srv.HTTPAddr()
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Timeout: 5 * time.Second,
+	}
+
+	// 1. Riker posts a public message (id=1) and a private message (id=2)
+	formPub := url.Values{
+		"content": {"Riker's original public log"},
+		"format":  {"text"},
+		"public1": {"1"},
+		"public2": {"1"},
+	}
+	req, _ := http.NewRequest(http.MethodPost, baseURL+"/post", strings.NewReader(formPub.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth("riker", "number1")
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("riker public post failed: err=%v status=%v", err, resp)
+	}
+	resp.Body.Close()
+
+	formPriv := url.Values{
+		"content": {"Riker's private holodeck schedule"},
+		"format":  {"text"},
+	}
+	req, _ = http.NewRequest(http.MethodPost, baseURL+"/post", strings.NewReader(formPriv.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth("riker", "number1")
+	resp, err = client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("riker private post failed: err=%v status=%v", err, resp)
+	}
+	resp.Body.Close()
+
+	// 2. Superuser (picard) edits Riker's public message (id=1)
+	editPub := url.Values{
+		"edit_id": {"1"},
+		"content": {"Riker's public log [Amended by Captain Picard]"},
+		"format":  {"text"},
+	}
+	req, _ = http.NewRequest(http.MethodPost, baseURL+"/post", strings.NewReader(editPub.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth("picard", "engage")
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("superuser edit public post failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Errorf("expected 303 when superuser edits public post, got %d", resp.StatusCode)
+	}
+
+	// Verify message #1 was updated and remained public & authored by Cmdr. Riker
+	m1, ok := srv.Site("127.0.0.1").Store().GetByID(1)
+	if !ok || m1.Content != "Riker's public log [Amended by Captain Picard]" || !m1.IsPublic || m1.Author != "Cmdr. Riker" {
+		t.Errorf("unexpected message #1 after superuser edit: %+v", m1)
+	}
+
+	// Superuser cannot edit Riker's private message (id=2)
+	editPriv := url.Values{
+		"edit_id": {"2"},
+		"content": {"Captain peeking"},
+		"format":  {"text"},
+	}
+	req, _ = http.NewRequest(http.MethodPost, baseURL+"/post", strings.NewReader(editPriv.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth("picard", "engage")
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("superuser edit private post request failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("expected 403 when superuser attempts to edit another user's private post, got %d", resp.StatusCode)
+	}
+
+	// 3. Non-superuser (riker) cannot hide posts or access user management endpoints
+	hideForm := url.Values{"id": {"1"}}
+	req, _ = http.NewRequest(http.MethodPost, baseURL+"/hide", strings.NewReader(hideForm.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth("riker", "number1")
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("non-superuser hide request failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("expected 403 when non-superuser calls /hide, got %d", resp.StatusCode)
+	}
+
+	// 4. Superuser (picard) hides post id=1
+	req, _ = http.NewRequest(http.MethodPost, baseURL+"/hide", strings.NewReader(hideForm.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth("picard", "engage")
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("superuser hide request failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Errorf("expected 303 when superuser hides post, got %d", resp.StatusCode)
+	}
+
+	// Verify micrologs/1.json has "hidden": true on message #1
+	rawJSONBytes, err := os.ReadFile(dataFilePath)
+	if err != nil {
+		t.Fatalf("failed to read micrologs/1.json: %v", err)
+	}
+	if !strings.Contains(string(rawJSONBytes), `"hidden": true`) {
+		t.Errorf("expected micrologs/1.json to contain '\"hidden\": true', got:\n%s", string(rawJSONBytes))
+	}
+
+	// Verify LOG (GetRecent and GET /) does not display hidden post #1
+	recent := srv.Site("127.0.0.1").Store().GetRecent("Cmdr. Riker", 10)
+	for _, m := range recent {
+		if m.ID == 1 {
+			t.Errorf("expected hidden post #1 to be excluded from GetRecent, but found it")
+		}
+	}
+
+	// 5. Superuser adds a new user ("worf") via User Dashboard (POST /users)
+	addUserForm := url.Values{
+		"handle":  {"Worf"},
+		"display": {"Lt. Worf"},
+		"pw":      {"prune_juice"},
+	}
+	req, _ = http.NewRequest(http.MethodPost, baseURL+"/users", strings.NewReader(addUserForm.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth("picard", "engage")
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("superuser add user failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Errorf("expected 303 after adding user, got %d", resp.StatusCode)
+	}
+
+	// Check pwfile contents: "superuser":true should ONLY appear on picard's line
+	pwFileBytes, err := os.ReadFile(pwFilePath)
+	if err != nil {
+		t.Fatalf("failed to read pwfile: %v", err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(pwFileBytes)), "\n") {
+		if strings.Contains(line, `"worf"`) || strings.Contains(line, `"riker"`) {
+			if strings.Contains(line, `"superuser"`) {
+				t.Errorf("non-superuser line must not contain 'superuser' attribute: %s", line)
+			}
+		}
+		if strings.Contains(line, `"picard"`) {
+			if !strings.Contains(line, `"superuser":true`) {
+				t.Errorf("superuser line must contain '\"superuser\":true': %s", line)
+			}
+		}
+	}
+
+	// Verify newly added user "worf" can immediately authenticate
+	req, _ = http.NewRequest(http.MethodGet, baseURL+"/?format=json", nil)
+	req.SetBasicAuth("worf", "prune_juice")
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("worf login check failed: %v", err)
+	}
+	var worfResp StardateResponse
+	_ = json.NewDecoder(resp.Body).Decode(&worfResp)
+	resp.Body.Close()
+	if worfResp.User != "Lt. Worf" {
+		t.Errorf("expected worf authenticated user 'Lt. Worf', got %q", worfResp.User)
+	}
+
+	// 6. Superuser disables user "riker" via User Dashboard (POST /users/disable)
+	disableForm := url.Values{
+		"handle":   {"riker"},
+		"disabled": {"1"},
+	}
+	req, _ = http.NewRequest(http.MethodPost, baseURL+"/users/disable", strings.NewReader(disableForm.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth("picard", "engage")
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("superuser disable user failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Errorf("expected 303 after disabling user, got %d", resp.StatusCode)
+	}
+
+	// Verify riker can no longer authenticate (GET /login returns 401)
+	req, _ = http.NewRequest(http.MethodGet, baseURL+"/login", nil)
+	req.SetBasicAuth("riker", "number1")
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("disabled riker login request failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("expected 401 Unauthorized for disabled user riker, got %d", resp.StatusCode)
+	}
+
+	// Verify pwfile has "disabled":true on riker's line
+	pwFileBytes, _ = os.ReadFile(pwFilePath)
+	if !strings.Contains(string(pwFileBytes), `"disabled":true`) {
+		t.Errorf("expected pwfile to contain '\"disabled\":true', got:\n%s", string(pwFileBytes))
+	}
+}
+
+func TestSiteTitleAndHideStardates(t *testing.T) {
+	srv, err := New(ServerConfig{
+		HTTPAddr: "127.0.0.1:0",
+		Sites: map[string]SiteConfig{
+			"127.0.0.1": {
+				Password:      "secret",
+				HideStardates: true,
+				SiteTitle:     "Captain's Journal 🚀",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	_, _ = srv.Site("127.0.0.1").Store().Add("kirk", "Testing custom site title and hidden stardates", true)
+
+	go func() {
+		_ = srv.Start()
+	}()
+	for i := 0; i < 50; i++ {
+		if srv.httpListener != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if srv.httpListener == nil {
+		t.Fatal("timed out waiting for HTTP listener")
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	}()
+
+	resp, err := http.Get("http://" + srv.HTTPAddr() + "/")
+	if err != nil {
+		t.Fatalf("GET / failed: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	html := string(body)
+
+	if !strings.Contains(html, "<h1>Captain&#39;s Journal 🚀</h1>") {
+		t.Errorf("expected custom unicode site title in <h1>, got:\n%s", html)
+	}
+	if strings.Contains(html, `<div class="stardate-live">`) || strings.Contains(html, `<span class="stardate-tag">`) {
+		t.Errorf("expected stardates to be hidden when HideStardates=true, got:\n%s", html)
+	}
+}
+
+func TestMultiSiteRoutingAndDirectories(t *testing.T) {
+	testDir := filepath.Join(".", ".test_tmp_multisite")
+	_ = os.RemoveAll(testDir)
+	defer os.RemoveAll(testDir)
+
+	yakDir := filepath.Join(testDir, "yak.net")
+	jbDir := filepath.Join(testDir, "jeanbowe.com")
+	if err := os.MkdirAll(yakDir, 0755); err != nil {
+		t.Fatalf("mkdir yak.net failed: %v", err)
+	}
+	if err := os.MkdirAll(jbDir, 0755); err != nil {
+		t.Fatalf("mkdir jeanbowe.com failed: %v", err)
+	}
+
+	// Write per-site config.json
+	if err := os.WriteFile(filepath.Join(yakDir, SiteConfigFilename), []byte(`{"pw":"yakpass","site_title":"Yak Net 🦬"}`), 0600); err != nil {
+		t.Fatalf("write yak.net/config.json failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(jbDir, SiteConfigFilename), []byte(`{"pw":"jbpass","site_title":"Jean Bowe","hide_stardates":true}`), 0600); err != nil {
+		t.Fatalf("write jeanbowe.com/config.json failed: %v", err)
+	}
+
+	srv, err := New(ServerConfig{
+		HTTPAddr: "127.0.0.1:0",
+		Dir:      testDir,
+	})
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	go func() {
+		_ = srv.Start()
+	}()
+	for i := 0; i < 50; i++ {
+		if srv.httpListener != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if srv.httpListener == nil {
+		t.Fatal("timed out waiting for HTTP listener")
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	}()
+
+	baseURL := "http://" + srv.HTTPAddr()
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Timeout: 5 * time.Second,
+	}
+
+	// 1. Unknown hostname (127.0.0.1 is not in testDir) should return 404
+	resp, err := client.Get(baseURL + "/")
+	if err != nil {
+		t.Fatalf("GET / for unknown host failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("expected 404 Not Found for unknown host 127.0.0.1, got %d", resp.StatusCode)
+	}
+
+	// 2. Post to yak.net using Host header with leading "www." ("www.yak.net")
+	postYak := url.Values{
+		"content": {"Hello from Yak Net!"},
+		"public1": {"1"},
+		"public2": {"1"},
+	}
+	req, _ := http.NewRequest(http.MethodPost, baseURL+"/post", strings.NewReader(postYak.Encode()))
+	req.Host = "www.yak.net"
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth("strick", "yakpass")
+	resp, err = client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("POST to www.yak.net failed: err=%v status=%v", err, resp)
+	}
+	resp.Body.Close()
+
+	// 3. Post to jeanbowe.com using "/@jeanbowe.com/post" URL override (even though Host is 127.0.0.1)
+	postJB := url.Values{
+		"content": {"Hello from Jean Bowe via @ override!"},
+		"public1": {"1"},
+		"public2": {"1"},
+	}
+	req, _ = http.NewRequest(http.MethodPost, baseURL+"/@jeanbowe.com/post", strings.NewReader(postJB.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth("jean", "jbpass")
+	resp, err = client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("POST to /@jeanbowe.com/post failed: err=%v status=%v", err, resp)
+	}
+	if loc := resp.Header.Get("Location"); loc != "/@jeanbowe.com/" {
+		t.Errorf("expected redirect Location '/@jeanbowe.com/', got %q", loc)
+	}
+	resp.Body.Close()
+
+	// 4. Verify yak.net page has Yak Net title and message, and NOT Jean Bowe's message
+	req, _ = http.NewRequest(http.MethodGet, baseURL+"/", nil)
+	req.Host = "yak.net"
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("GET yak.net failed: %v", err)
+	}
+	yakBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	yakHTML := string(yakBody)
+	if !strings.Contains(yakHTML, "<h1>Yak Net 🦬</h1>") || !strings.Contains(yakHTML, "Hello from Yak Net!") {
+		t.Errorf("unexpected yak.net HTML:\n%s", yakHTML)
+	}
+	if strings.Contains(yakHTML, "Hello from Jean Bowe") {
+		t.Errorf("yak.net must not show jeanbowe.com messages")
+	}
+
+	// 5. Verify /@jeanbowe.com/ page has Jean Bowe title, message, hidden stardates, and /@jeanbowe.com action links
+	resp, err = client.Get(baseURL + "/@jeanbowe.com/")
+	if err != nil {
+		t.Fatalf("GET /@jeanbowe.com/ failed: %v", err)
+	}
+	jbBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	jbHTML := string(jbBody)
+	if !strings.Contains(jbHTML, "<h1>Jean Bowe</h1>") || !strings.Contains(jbHTML, "Hello from Jean Bowe via @ override!") {
+		t.Errorf("unexpected jeanbowe.com HTML:\n%s", jbHTML)
+	}
+	if !strings.Contains(jbHTML, `href="/@jeanbowe.com/login"`) {
+		t.Errorf("expected login link to use /@jeanbowe.com/login")
+	}
+	if strings.Contains(jbHTML, `<div class="stardate-live">`) {
+		t.Errorf("expected stardates to be hidden on jeanbowe.com")
+	}
+
+	// 6. Verify micrologs/1.json files were persisted in their respective site subdirectories
+	if _, err := os.Stat(filepath.Join(yakDir, DirMicrologs, "1.json")); err != nil {
+		t.Errorf("expected yak.net/micrologs/1.json to exist: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(jbDir, DirMicrologs, "1.json")); err != nil {
+		t.Errorf("expected jeanbowe.com/micrologs/1.json to exist: %v", err)
+	}
+}
+
+func TestPostingFlavorsStarredAndGallery(t *testing.T) {
+	testDir := filepath.Join(".", ".test_tmp_flavors")
+	_ = os.RemoveAll(testDir)
+	defer os.RemoveAll(testDir)
+
+	siteDir := filepath.Join(testDir, "yak.net")
+	if err := os.MkdirAll(siteDir, 0755); err != nil {
+		t.Fatalf("mkdir yak.net failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(siteDir, SiteConfigFilename), []byte(`{"pw":"secret","site_title":"Yak Net"}`), 0600); err != nil {
+		t.Fatalf("write config.json failed: %v", err)
+	}
+
+	srv, err := New(ServerConfig{
+		HTTPAddr: "127.0.0.1:0",
+		Dir:      testDir,
+	})
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	go func() {
+		_ = srv.Start()
+	}()
+	for i := 0; i < 50; i++ {
+		if srv.httpListener != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if srv.httpListener == nil {
+		t.Fatal("timed out waiting for HTTP listener")
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	}()
+
+	baseURL := "http://" + srv.HTTPAddr()
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Timeout: 5 * time.Second,
+	}
+
+	// 1. Create a standard "log" post (default flavor) - even if is_starred=1 is passed, log posts must have is_starred: false
+	logForm := url.Values{
+		"flavor":     {"log"},
+		"content":    {"Just a quick log entry"},
+		"is_starred": {"1"},
+		"public1":    {"1"},
+		"public2":    {"1"},
+	}
+	req, _ := http.NewRequest(http.MethodPost, baseURL+"/@yak.net/post", strings.NewReader(logForm.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth("kirk", "secret")
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("POST log failed: err=%v status=%v", err, resp)
+	}
+	resp.Body.Close()
+
+	// 2. Create an "article" post with title, two paragraphs separated by blank line, attachment, and is_starred=true
+	var artBuf bytes.Buffer
+	artMW := multipart.NewWriter(&artBuf)
+	_ = artMW.WriteField("flavor", "article")
+	_ = artMW.WriteField("title", "Warp Field Dynamics")
+	_ = artMW.WriteField("content", "Detailed first paragraph about warp coils.\n\nSecond paragraph with subspace equations.")
+	_ = artMW.WriteField("format", "markdown")
+	_ = artMW.WriteField("is_starred", "1")
+	_ = artMW.WriteField("public1", "1")
+	_ = artMW.WriteField("public2", "1")
+	afw, err := artMW.CreateFormFile("attachments", "telemetry.txt")
+	if err != nil {
+		t.Fatalf("CreateFormFile attachments failed: %v", err)
+	}
+	fakeTelemetry := []byte("TELEMETRY_LOG_DATA_99")
+	_, _ = afw.Write(fakeTelemetry)
+	_ = artMW.Close()
+
+	req, _ = http.NewRequest(http.MethodPost, baseURL+"/@yak.net/post", &artBuf)
+	req.Header.Set("Content-Type", artMW.FormDataContentType())
+	req.SetBasicAuth("spock", "secret")
+	resp, err = client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("POST article failed: err=%v status=%v", err, resp)
+	}
+	resp.Body.Close()
+
+	// 3. Create a "gallery" post with multipart image upload and is_starred=false
+	var bodyBuf bytes.Buffer
+	mw := multipart.NewWriter(&bodyBuf)
+	_ = mw.WriteField("flavor", "gallery")
+	_ = mw.WriteField("title", "Nebula Photos")
+	_ = mw.WriteField("content", "Captured by long-range sensors.")
+	_ = mw.WriteField("public1", "1")
+	_ = mw.WriteField("public2", "1")
+	fw, err := mw.CreateFormFile("images", "nebula.png")
+	if err != nil {
+		t.Fatalf("CreateFormFile failed: %v", err)
+	}
+	fakePNG := []byte("FAKE_PNG_IMAGE_BYTES_12345")
+	_, _ = fw.Write(fakePNG)
+	_ = mw.Close()
+
+	req, _ = http.NewRequest(http.MethodPost, baseURL+"/@yak.net/post", &bodyBuf)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.SetBasicAuth("uhura", "secret")
+	resp, err = client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("POST gallery failed: err=%v status=%v", err, resp)
+	}
+	resp.Body.Close()
+
+	// 4. Verify separate JSON files in micrologs/1.json, articles/2.json, and galleries/3.json
+	rawLogJSON, err := os.ReadFile(filepath.Join(siteDir, DirMicrologs, "1.json"))
+	if err != nil {
+		t.Fatalf("failed to read micrologs/1.json: %v", err)
+	}
+	if !strings.Contains(string(rawLogJSON), `"flavor": "log"`) || !strings.Contains(string(rawLogJSON), `"is_starred": false`) {
+		t.Errorf("unexpected micrologs/1.json:\n%s", string(rawLogJSON))
+	}
+
+	rawArticleJSON, err := os.ReadFile(filepath.Join(siteDir, DirArticles, "2.json"))
+	if err != nil {
+		t.Fatalf("failed to read articles/2.json: %v", err)
+	}
+	if !strings.Contains(string(rawArticleJSON), `"flavor": "article"`) || !strings.Contains(string(rawArticleJSON), `"is_starred": true`) || !strings.Contains(string(rawArticleJSON), "Second paragraph with subspace equations.") || !strings.Contains(string(rawArticleJSON), `"telemetry.txt"`) {
+		t.Errorf("unexpected articles/2.json:\n%s", string(rawArticleJSON))
+	}
+
+	rawGalleryJSON, err := os.ReadFile(filepath.Join(siteDir, DirGalleries, "3.json"))
+	if err != nil {
+		t.Fatalf("failed to read galleries/3.json: %v", err)
+	}
+	if !strings.Contains(string(rawGalleryJSON), `"flavor": "gallery"`) || !strings.Contains(string(rawGalleryJSON), `"nebula.png"`) {
+		t.Errorf("unexpected galleries/3.json:\n%s", string(rawGalleryJSON))
+	}
+
+	// Verify in-RAM state of article #2 only holds the first paragraph, while GetByID reads the full article from disk
+	ramM2, ok := srv.Site("yak.net").Store().GetRAMByID(2)
+	if !ok || ramM2.Content != "Detailed first paragraph about warp coils." || !ramM2.HasMore {
+		t.Errorf("expected in-RAM article #2 to hold only first paragraph with HasMore=true, got %+v", ramM2)
+	}
+
+	// Verify via Store.GetByID that full posts are returned from disk
+	m1, ok := srv.Site("yak.net").Store().GetByID(1)
+	if !ok || m1.Flavor != FlavorLog || m1.IsStarred {
+		t.Errorf("expected message #1 to be unstarred log, got %+v", m1)
+	}
+	m2, ok := srv.Site("yak.net").Store().GetByID(2)
+	if !ok || m2.Flavor != FlavorArticle || !m2.IsStarred || m2.Title != "Warp Field Dynamics" || !strings.Contains(m2.Content, "Second paragraph with subspace equations.") || len(m2.Attachments) != 1 || m2.Attachments[0] != "telemetry.txt" {
+		t.Errorf("expected message #2 from GetByID to be full starred article with telemetry.txt, got %+v", m2)
+	}
+	m3, ok := srv.Site("yak.net").Store().GetByID(3)
+	if !ok || m3.Flavor != FlavorGallery || m3.IsStarred || len(m3.Images) != 1 || m3.Images[0] != "nebula.png" || len(m3.Attachments) != 0 {
+		t.Errorf("expected message #3 to be unstarred gallery with nebula.png and no attachments, got %+v", m3)
+	}
+
+	// 5. Verify uploaded gallery image is in images/3/nebula.png and served at /@yak.net/images/3/nebula.png,
+	// and article attachment is in attachments/2/telemetry.txt and served at /@yak.net/attachments/2/telemetry.txt
+	if _, err := os.Stat(filepath.Join(siteDir, DirImages, "3", "nebula.png")); err != nil {
+		t.Errorf("expected images/3/nebula.png on disk: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(siteDir, DirAttachments, "2", "telemetry.txt")); err != nil {
+		t.Errorf("expected attachments/2/telemetry.txt on disk: %v", err)
+	}
+
+	imgResp, err := client.Get(baseURL + "/@yak.net/images/3/nebula.png")
+	if err != nil {
+		t.Fatalf("GET image failed: %v", err)
+	}
+	imgBytes, _ := io.ReadAll(imgResp.Body)
+	imgResp.Body.Close()
+	if imgResp.StatusCode != http.StatusOK || !bytes.Equal(imgBytes, fakePNG) {
+		t.Errorf("unexpected image response: status=%d body=%q", imgResp.StatusCode, string(imgBytes))
+	}
+
+	attResp, err := client.Get(baseURL + "/@yak.net/attachments/2/telemetry.txt")
+	if err != nil {
+		t.Fatalf("GET attachment failed: %v", err)
+	}
+	attBytes, _ := io.ReadAll(attResp.Body)
+	attResp.Body.Close()
+	if attResp.StatusCode != http.StatusOK || !bytes.Equal(attBytes, fakeTelemetry) {
+		t.Errorf("unexpected attachment response: status=%d body=%q", attResp.StatusCode, string(attBytes))
+	}
+
+	// 6. Verify HTML UI contains the creation flavor chooser, Starred section, gallery image,
+	// UTC permalink link, first paragraph of article #2, MORE link, and NOT the second paragraph in the rendered summary
+	req, _ = http.NewRequest(http.MethodGet, baseURL+"/@yak.net/", nil)
+	req.SetBasicAuth("kirk", "secret")
+	pageResp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("GET /@yak.net/ failed: %v", err)
+	}
+	pageBytes, _ := io.ReadAll(pageResp.Body)
+	pageResp.Body.Close()
+	pageHTML := string(pageBytes)
+
+	for _, needle := range []string{
+		`id="flavor-chooser"`,
+		`chooseFlavor('log')`,
+		`chooseFlavor('article')`,
+		`chooseFlavor('gallery')`,
+		`Log Post`,
+		`Article Page`,
+		`Image Gallery`,
+		`Starred Articles &amp; Galleries`,
+		`Warp Field Dynamics`,
+		`/@yak.net/images/3/nebula.png`,
+		`/@yak.net/attachments/2/telemetry.txt`,
+		`<a href="/@yak.net/2" class="permalink">`,
+		`<a href="/@yak.net/2" class="more-link">MORE</a>`,
+		`Detailed first paragraph about warp coils.`,
+	} {
+		if !strings.Contains(pageHTML, needle) {
+			t.Errorf("expected HTML to contain %q", needle)
+		}
+	}
+	if strings.Contains(pageHTML, "Second paragraph with subspace equations.") {
+		t.Errorf("expected Recent Posts not to contain second paragraph of article #2 at all (since only first paragraph is in RAM)")
+	}
+
+	// 7. Verify permalink page /@yak.net/2 renders the full article (both paragraphs) from disk and back button
+	permResp, err := client.Get(baseURL + "/@yak.net/2")
+	if err != nil {
+		t.Fatalf("GET /@yak.net/2 failed: %v", err)
+	}
+	permBytes, _ := io.ReadAll(permResp.Body)
+	permResp.Body.Close()
+	permHTML := string(permBytes)
+	if permResp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 OK for /@yak.net/2, got %d", permResp.StatusCode)
+	}
+	for _, needle := range []string{
+		`href="/@yak.net/" class="btn btn-primary">&larr; Recent Posts</a>`,
+		`Warp Field Dynamics`,
+		`Detailed first paragraph about warp coils.`,
+		`Second paragraph with subspace equations.`,
+	} {
+		if !strings.Contains(permHTML, needle) {
+			t.Errorf("expected permalink HTML to contain %q, got:\n%s", needle, permHTML)
+		}
+	}
+
+	// Also verify ExtractArticleFirstParagraph with HTML <P> and <p>
+	htmlSum, htmlMore := ExtractArticleFirstParagraph("First HTML para<P>Second HTML para", FormatHTML)
+	if !htmlMore || !strings.Contains(string(htmlSum), "First HTML para") || strings.Contains(string(htmlSum), "Second HTML para") {
+		t.Errorf("unexpected ExtractArticleFirstParagraph for <P>: more=%v sum=%q", htmlMore, string(htmlSum))
+	}
+}
 

@@ -101,9 +101,7 @@ func TestStorePersistence(t *testing.T) {
 	_ = os.RemoveAll(testDir)
 	defer os.RemoveAll(testDir)
 
-	dbFile := filepath.Join(testDir, "messages.json")
-
-	store1, err := NewStore(dbFile)
+	store1, err := NewStore(testDir)
 	if err != nil {
 		t.Fatalf("failed to create store: %v", err)
 	}
@@ -116,46 +114,83 @@ func TestStorePersistence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to add message: %v", err)
 	}
+	fullArticle := "First paragraph of the treatise.\n\nSecond paragraph that should only live on disk."
+	m3, err := store1.AddEntry("spock", FlavorArticle, "Logic Treatise", nil, true, fullArticle, FormatMarkdown, true)
+	if err != nil {
+		t.Fatalf("failed to add article: %v", err)
+	}
 
-	// Reload from same file
-	store2, err := NewStore(dbFile)
+	// Verify individual files exist in micrologs/ and articles/
+	if _, err := os.Stat(filepath.Join(testDir, DirMicrologs, "1.json")); err != nil {
+		t.Errorf("expected micrologs/1.json to exist: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(testDir, DirMicrologs, "2.json")); err != nil {
+		t.Errorf("expected micrologs/2.json to exist: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(testDir, DirArticles, "3.json")); err != nil {
+		t.Errorf("expected articles/3.json to exist: %v", err)
+	}
+
+	// Verify in-RAM article only stores the first paragraph, while GetByID reads full article from disk
+	ramM3, ok := store1.GetRAMByID(m3.ID)
+	if !ok || ramM3.Content != "First paragraph of the treatise." || !ramM3.HasMore {
+		t.Errorf("expected in-RAM article to hold only first paragraph with HasMore=true, got %+v", ramM3)
+	}
+	diskM3, ok := store1.GetByID(m3.ID)
+	if !ok || diskM3.Content != fullArticle {
+		t.Errorf("expected GetByID to return full article from disk, got %+v", diskM3)
+	}
+
+	// Reload from same site directory
+	store2, err := NewStore(testDir)
 	if err != nil {
 		t.Fatalf("failed to reload store: %v", err)
 	}
 
-	if store2.Count() != 2 {
-		t.Fatalf("expected 2 messages reloaded, got %d", store2.Count())
+	if store2.Count() != 3 {
+		t.Fatalf("expected 3 messages reloaded, got %d", store2.Count())
+	}
+
+	ramM3Reloaded, ok := store2.GetRAMByID(m3.ID)
+	if !ok || ramM3Reloaded.Content != "First paragraph of the treatise." || !ramM3Reloaded.HasMore {
+		t.Errorf("expected reloaded in-RAM article to hold only first paragraph, got %+v", ramM3Reloaded)
+	}
+	diskM3Reloaded, ok := store2.GetByID(m3.ID)
+	if !ok || diskM3Reloaded.Content != fullArticle {
+		t.Errorf("expected reloaded GetByID to return full article from disk, got %+v", diskM3Reloaded)
 	}
 
 	spockMsgs := store2.GetRecent("spock", 10)
-	if len(spockMsgs) != 1 || spockMsgs[0].Content != m1.Content {
+	if len(spockMsgs) != 2 || spockMsgs[1].Content != m1.Content {
 		t.Errorf("unexpected messages for spock: %+v", spockMsgs)
 	}
 
 	kirkMsgs := store2.GetRecent("kirk", 10)
-	if len(kirkMsgs) != 2 {
-		t.Errorf("expected 2 messages for kirk, got %d", len(kirkMsgs))
+	if len(kirkMsgs) != 3 {
+		t.Errorf("expected 3 messages for kirk, got %d", len(kirkMsgs))
 	}
-	if kirkMsgs[0].Content != m2.Content { // newest first
-		t.Errorf("expected newest message to be Kirk's, got %s", kirkMsgs[0].Content)
+	if kirkMsgs[1].Content != m2.Content {
+		t.Errorf("expected second newest message to be Kirk's, got %s", kirkMsgs[1].Content)
 	}
 
 	// Test missing is_public field in JSON defaults to private (not public)
-	missingFieldFile := filepath.Join(testDir, "missing_is_public.json")
-	rawJSON := `[
-  {
-    "id": 1,
-    "author": "mccoy",
-    "content": "I'm a doctor, not a bricklayer!",
-    "created_at": "2026-10-15T07:00:00Z",
-    "stardate": 26780.0
-  }
-]`
-	if err := os.WriteFile(missingFieldFile, []byte(rawJSON), 0644); err != nil {
+	missingSiteDir := filepath.Join(testDir, "missing_site")
+	missingLogDir := filepath.Join(missingSiteDir, DirMicrologs)
+	if err := os.MkdirAll(missingLogDir, 0755); err != nil {
+		t.Fatalf("mkdir failed: %v", err)
+	}
+	rawJSON := `{
+  "id": 1,
+  "author": "mccoy",
+  "content": "I'm a doctor, not a bricklayer!",
+  "created_at": "2026-10-15T07:00:00Z",
+  "stardate": 26780.0
+}`
+	if err := os.WriteFile(filepath.Join(missingLogDir, "1.json"), []byte(rawJSON), 0644); err != nil {
 		t.Fatalf("failed to write raw JSON: %v", err)
 	}
 
-	store3, err := NewStore(missingFieldFile)
+	store3, err := NewStore(missingSiteDir)
 	if err != nil {
 		t.Fatalf("failed to load store with missing is_public: %v", err)
 	}
