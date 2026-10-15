@@ -1,0 +1,25 @@
+# Binaries
+/stardate
+/build/
+*.exe
+*.test
+
+# Editor backup files
+*.un~
+*.swp
+*~
+
+# TLS files (if generated to disk)
+*.pem
+*.key
+*.crt
+
+# Test temporary files
+.test_tmp/
+.go_cache/
+
+# Message storage
+messages.json
+/data/
+*.tmp
+
