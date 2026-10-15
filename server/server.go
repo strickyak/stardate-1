@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -1048,16 +1050,97 @@ func parseCSVFilenames(csv string) []string {
 	return list
 }
 
-func buildPageMessage(m Message, loggedIn, isSuperuser bool, effectiveUser string, singleView bool) pageMessage {
+var dataImgSrcRe = regexp.MustCompile(`(?i)src=["']data:image/(png|jpeg|jpg|gif|webp);base64,([A-Za-z0-9+/=\s]+)["']`)
+
+func rewriteHTMLImageBasePath(htmlContent, basePath string) string {
+	if basePath == "" || !strings.Contains(htmlContent, "/images/") {
+		return htmlContent
+	}
+	res := strings.ReplaceAll(htmlContent, `src="/images/`, `src="`+basePath+`/images/`)
+	res = strings.ReplaceAll(res, `src='/images/`, `src='`+basePath+`/images/`)
+	return res
+}
+
+func extractInlineDataImages(site *Site, basePath string, postID int64, htmlContent string) (string, error) {
+	if basePath != "" {
+		htmlContent = strings.ReplaceAll(htmlContent, `src="`+basePath+`/images/`, `src="/images/`)
+		htmlContent = strings.ReplaceAll(htmlContent, `src='`+basePath+`/images/`, `src='/images/`)
+	}
+	if !dataImgSrcRe.MatchString(htmlContent) {
+		return htmlContent, nil
+	}
+
+	var firstErr error
+	imgIdx := 0
+	replaced := dataImgSrcRe.ReplaceAllStringFunc(htmlContent, func(match string) string {
+		if firstErr != nil {
+			return match
+		}
+		sub := dataImgSrcRe.FindStringSubmatch(match)
+		if len(sub) < 3 {
+			return match
+		}
+		imgIdx++
+		ext := strings.ToLower(sub[1])
+		if ext == "jpeg" {
+			ext = "jpg"
+		}
+		b64Clean := strings.Map(func(r rune) rune {
+			if r == ' ' || r == '\n' || r == '\r' || r == '\t' {
+				return -1
+			}
+			return r
+		}, sub[2])
+
+		rawBytes, err := base64.StdEncoding.DecodeString(b64Clean)
+		if err != nil {
+			rawBytes, err = base64.RawStdEncoding.DecodeString(b64Clean)
+			if err != nil {
+				firstErr = fmt.Errorf("invalid base64 inline image: %w", err)
+				return match
+			}
+		}
+
+		savedName := fmt.Sprintf("inline_%d.%s", imgIdx, ext)
+		if site.dir != "" {
+			postImgDir := filepath.Join(site.dir, DirImages, strconv.FormatInt(postID, 10))
+			if err := os.MkdirAll(postImgDir, 0755); err != nil {
+				firstErr = fmt.Errorf("failed to create images directory: %w", err)
+				return match
+			}
+			destPath := filepath.Join(postImgDir, savedName)
+			if _, err := os.Stat(destPath); err == nil {
+				savedName = fmt.Sprintf("inline_%d_%d.%s", imgIdx, time.Now().UnixNano(), ext)
+				destPath = filepath.Join(postImgDir, savedName)
+			}
+			if err := os.WriteFile(destPath, rawBytes, 0644); err != nil {
+				firstErr = fmt.Errorf("failed to save inline image: %w", err)
+				return match
+			}
+		}
+		return fmt.Sprintf(`src="/images/%d/%s"`, postID, savedName)
+	})
+
+	if firstErr != nil {
+		return htmlContent, firstErr
+	}
+	return replaced, nil
+}
+
+func buildPageMessage(m Message, basePath string, loggedIn, isSuperuser bool, effectiveUser string, singleView bool) pageMessage {
 	fmtNorm := NormalizeFormat(m.Format)
 	flavNorm := NormalizeFlavor(m.Flavor)
 	canEdit := loggedIn && (m.Author == effectiveUser || (isSuperuser && m.IsPublic))
-	renderedHTML := RenderAndSanitize(m.Content, fmtNorm)
+	contentForView := m.Content
+	if fmtNorm == FormatHTML {
+		contentForView = rewriteHTMLImageBasePath(contentForView, basePath)
+	}
+	renderedHTML := RenderAndSanitize(contentForView, fmtNorm)
 	summaryHTML := renderedHTML
 	hasMore := m.HasMore
 	if !singleView && flavNorm == FlavorArticle {
 		var extractedMore bool
-		summaryHTML, extractedMore = ExtractArticleFirstParagraph(m.Content, fmtNorm)
+		summaryHTML, extractedMore = ExtractArticleFirstParagraph(contentForView, fmtNorm)
 		if extractedMore {
 			hasMore = true
 		}
@@ -1072,7 +1155,7 @@ func buildPageMessage(m Message, loggedIn, isSuperuser bool, effectiveUser strin
 		Attachments:    m.Attachments,
 		AttachmentsCSV: strings.Join(m.Attachments, ","),
 		IsStarred:      m.IsStarred && (flavNorm == FlavorArticle || flavNorm == FlavorGallery),
-		Content:        m.Content,
+		Content:        contentForView,
 		RenderedHTML:   renderedHTML,
 		SummaryHTML:    summaryHTML,
 		HasMore:        hasMore,
@@ -1122,6 +1205,10 @@ func (s *Server) handleSiteSinglePost(site *Site, basePath string, postID int64,
 		}
 	}
 
+	if NormalizeFormat(m.Format) == FormatHTML {
+		m.Content = rewriteHTMLImageBasePath(m.Content, basePath)
+	}
+
 	if r.URL.Query().Get("format") == "json" || strings.Contains(r.Header.Get("Accept"), "application/json") {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		_ = json.NewEncoder(w).Encode(m)
@@ -1131,7 +1218,7 @@ func (s *Server) handleSiteSinglePost(site *Site, basePath string, postID int64,
 	now := time.Now().UTC()
 	sd := CalculateStardate(now)
 	isSuperuser := loggedIn && auth.IsSuperuser
-	pm := buildPageMessage(m, loggedIn, isSuperuser, effectiveUser, true)
+	pm := buildPageMessage(m, basePath, loggedIn, isSuperuser, effectiveUser, true)
 
 	siteTitle := site.cfg.SiteTitle
 	if siteTitle == "" {
@@ -1226,7 +1313,7 @@ func (s *Server) handleSiteRoot(site *Site, basePath string, w http.ResponseWrit
 	viewMsgs := make([]pageMessage, 0, len(displayMsgs))
 	var starredItems []pageMessage
 	for _, m := range displayMsgs {
-		pm := buildPageMessage(m, loggedIn, isSuperuser, viewer, false)
+		pm := buildPageMessage(m, basePath, loggedIn, isSuperuser, viewer, false)
 		viewMsgs = append(viewMsgs, pm)
 		if pm.IsStarred {
 			starredItems = append(starredItems, pm)
@@ -1379,8 +1466,14 @@ func (s *Server) handleSitePost(site *Site, basePath string, w http.ResponseWrit
 	flavor := NormalizeFlavor(r.FormValue("flavor"))
 	title := strings.TrimSpace(r.FormValue("title"))
 	format := NormalizeFormat(r.FormValue("format"))
-	content := strings.TrimSpace(r.FormValue("content"))
-	if format == FormatHTML {
+	rawContent := strings.TrimSpace(r.FormValue("content"))
+	hasInlineDataImg := format == FormatHTML && dataImgSrcRe.MatchString(rawContent)
+	content := rawContent
+	if format == FormatHTML && !hasInlineDataImg {
+		if basePath != "" {
+			content = strings.ReplaceAll(content, `src="`+basePath+`/images/`, `src="/images/`)
+			content = strings.ReplaceAll(content, `src='`+basePath+`/images/`, `src='/images/`)
+		}
 		content = strings.TrimSpace(htmlPolicy.Sanitize(content))
 		if content == "<p><br></p>" || content == "<p></p>" {
 			content = ""
@@ -1424,19 +1517,19 @@ func (s *Server) handleSitePost(site *Site, basePath string, w http.ResponseWrit
 		title = ""
 		imageList = nil
 		isStarred = false
-		if content == "" && len(attachmentList) == 0 && !hasUploadedAttachments {
+		if content == "" && !hasInlineDataImg && len(attachmentList) == 0 && !hasUploadedAttachments {
 			http.Redirect(w, r, basePath+"/", http.StatusSeeOther)
 			return
 		}
 	} else if flavor == FlavorArticle {
 		imageList = nil
-		if content == "" && title == "" && len(attachmentList) == 0 && !hasUploadedAttachments {
+		if content == "" && !hasInlineDataImg && title == "" && len(attachmentList) == 0 && !hasUploadedAttachments {
 			http.Redirect(w, r, basePath+"/", http.StatusSeeOther)
 			return
 		}
 	} else if flavor == FlavorGallery {
 		attachmentList = nil
-		if content == "" && title == "" && len(imageList) == 0 && !hasUploadedImages {
+		if content == "" && !hasInlineDataImg && title == "" && len(imageList) == 0 && !hasUploadedImages {
 			http.Redirect(w, r, basePath+"/", http.StatusSeeOther)
 			return
 		}
@@ -1467,6 +1560,18 @@ func (s *Server) handleSitePost(site *Site, basePath string, w http.ResponseWrit
 		}
 		if flavor != FlavorGallery && len(attachmentList) == 0 && len(origMsg.Attachments) > 0 && r.FormValue("existing_attachments") == "" {
 			attachmentList = origMsg.Attachments
+		}
+
+		if format == FormatHTML && hasInlineDataImg {
+			extracted, err := extractInlineDataImages(site, basePath, editID, rawContent)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			content = strings.TrimSpace(htmlPolicy.Sanitize(extracted))
+			if content == "<p><br></p>" || content == "<p></p>" {
+				content = ""
+			}
 		}
 
 		if len(uploadedImages) > 0 {
@@ -1524,10 +1629,14 @@ func (s *Server) handleSitePost(site *Site, basePath string, w http.ResponseWrit
 		return
 	}
 
-	contentToStore := content
+	initialContent := content
+	if hasInlineDataImg {
+		initialContent = ""
+	}
+	contentToStore := initialContent
 	titleToStore := title
 	if !isPublic && auth.IsCrypto {
-		encrypted, err := EncryptMessage(content, auth.CryptoKey)
+		encrypted, err := EncryptMessage(initialContent, auth.CryptoKey)
 		if err != nil {
 			http.Error(w, "Failed to encrypt private message", http.StatusInternalServerError)
 			return
@@ -1547,6 +1656,31 @@ func (s *Server) handleSitePost(site *Site, basePath string, w http.ResponseWrit
 	if err != nil {
 		http.Error(w, "Failed to save message", http.StatusInternalServerError)
 		return
+	}
+
+	if hasInlineDataImg {
+		extracted, err := extractInlineDataImages(site, basePath, createdMsg.ID, rawContent)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		content = strings.TrimSpace(htmlPolicy.Sanitize(extracted))
+		if content == "<p><br></p>" || content == "<p></p>" {
+			content = ""
+		}
+		finalContentToStore := content
+		if !isPublic && auth.IsCrypto {
+			encrypted, err := EncryptMessage(content, auth.CryptoKey)
+			if err != nil {
+				http.Error(w, "Failed to encrypt private message", http.StatusInternalServerError)
+				return
+			}
+			finalContentToStore = encrypted
+		}
+		if _, err := site.store.UpdateEntry(createdMsg.ID, auth.EffectiveUser, auth.IsSuperuser, flavor, titleToStore, imageList, isStarred, finalContentToStore, format, isPublic); err != nil {
+			http.Error(w, "Failed to update message with inline images", http.StatusInternalServerError)
+			return
+		}
 	}
 
 	if len(uploadedImages) > 0 {
@@ -2220,6 +2354,13 @@ const indexHTML = `<!DOCTYPE html>
       color: var(--accent);
       text-decoration: underline;
     }
+    .message-content .rich-content img,
+    #quill-wrapper .ql-editor img {
+      max-width: 100%;
+      height: auto;
+      border-radius: 6px;
+      margin: 0.4rem 0;
+    }
     .stardate-tag { font-family: monospace; }
     .permalink {
       color: var(--muted);
@@ -2581,16 +2722,25 @@ const indexHTML = `<!DOCTYPE html>
 
     function initQuillIfNeeded() {
       if (quillInstance || typeof Quill === 'undefined') return;
+      try {
+        var ImageBlot = Quill.import('formats/image');
+        if (ImageBlot) {
+          ImageBlot.sanitize = function(url) { return url; };
+        }
+      } catch (err) {}
       quillInstance = new Quill('#quill-editor', {
         theme: 'snow',
         placeholder: 'Write formatted rich text...',
         modules: {
+          uploader: {
+            mimetypes: ['image/png', 'image/jpeg', 'image/gif', 'image/webp']
+          },
           toolbar: [
             [{ 'header': [1, 2, 3, false] }],
             ['bold', 'italic', 'underline', 'strike'],
             ['blockquote', 'code-block'],
             [{ 'list': 'ordered'}, { 'list': 'bullet' }],
-            ['link', 'clean']
+            ['link', 'image', 'clean']
           ]
         }
       });
@@ -2669,11 +2819,12 @@ const indexHTML = `<!DOCTYPE html>
     function prepareSubmit(e) {
       if (currentMode === 'html' && quillInstance) {
         var text = quillInstance.getText().trim();
-        if (!text && currentFlavor === 'log') {
+        var hasImg = quillInstance.root.querySelector('img') !== null;
+        if (!text && !hasImg && currentFlavor === 'log') {
           if (e) e.preventDefault();
           return false;
         }
-        var html = text ? (quillInstance.getSemanticHTML ? quillInstance.getSemanticHTML() : quillInstance.root.innerHTML) : '';
+        var html = (text || hasImg) ? (quillInstance.getSemanticHTML ? quillInstance.getSemanticHTML() : quillInstance.root.innerHTML) : '';
         document.getElementById('content-input').value = html;
       }
       return true;

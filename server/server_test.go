@@ -1401,5 +1401,56 @@ func TestPostingFlavorsStarredAndGallery(t *testing.T) {
 	if !htmlMore || !strings.Contains(string(htmlSum), "First HTML para") || strings.Contains(string(htmlSum), "Second HTML para") {
 		t.Errorf("unexpected ExtractArticleFirstParagraph for <P>: more=%v sum=%q", htmlMore, string(htmlSum))
 	}
+
+	// 8. Verify Quill inline image (data:image/png;base64,...) is extracted to images/4/inline_1.png and rewritten in HTML
+	inlinePNG := []byte("INLINE_QUILL_IMAGE_BYTES_777")
+	inlineB64 := base64.StdEncoding.EncodeToString(inlinePNG)
+	quillImgForm := url.Values{
+		"flavor":  {"article"},
+		"title":   {"Illustrated Article"},
+		"format":  {"html"},
+		"content": {`<p>Here is an inline photo: <img src="data:image/png;base64,` + inlineB64 + `"></p>`},
+		"public1": {"1"},
+		"public2": {"1"},
+	}
+	req, _ = http.NewRequest(http.MethodPost, baseURL+"/@yak.net/post", strings.NewReader(quillImgForm.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth("spock", "secret")
+	resp, err = client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("POST Quill inline image article failed: err=%v status=%v", err, resp)
+	}
+	resp.Body.Close()
+
+	// Check that articles/4.json has src="/images/4/inline_1.png" and NOT base64 data
+	art4JSON, err := os.ReadFile(filepath.Join(siteDir, DirArticles, "4.json"))
+	if err != nil {
+		t.Fatalf("failed to read articles/4.json: %v", err)
+	}
+	if !strings.Contains(string(art4JSON), `/images/4/inline_1.png`) || strings.Contains(string(art4JSON), "data:image") {
+		t.Errorf("expected articles/4.json to reference /images/4/inline_1.png without data URI, got:\n%s", string(art4JSON))
+	}
+
+	// Check that /@yak.net/images/4/inline_1.png serves the decoded image bytes
+	inlineResp, err := client.Get(baseURL + "/@yak.net/images/4/inline_1.png")
+	if err != nil {
+		t.Fatalf("GET /@yak.net/images/4/inline_1.png failed: %v", err)
+	}
+	inlineServed, _ := io.ReadAll(inlineResp.Body)
+	inlineResp.Body.Close()
+	if inlineResp.StatusCode != http.StatusOK || !bytes.Equal(inlineServed, inlinePNG) {
+		t.Errorf("unexpected inline image response: status=%d body=%q", inlineResp.StatusCode, string(inlineServed))
+	}
+
+	// Check that /@yak.net/4 renders src="/@yak.net/images/4/inline_1.png"
+	perm4Resp, err := client.Get(baseURL + "/@yak.net/4")
+	if err != nil {
+		t.Fatalf("GET /@yak.net/4 failed: %v", err)
+	}
+	perm4Bytes, _ := io.ReadAll(perm4Resp.Body)
+	perm4Resp.Body.Close()
+	if !strings.Contains(string(perm4Bytes), `src="/@yak.net/images/4/inline_1.png"`) {
+		t.Errorf("expected /@yak.net/4 to render src=\"/@yak.net/images/4/inline_1.png\", got:\n%s", string(perm4Bytes))
+	}
 }
 
