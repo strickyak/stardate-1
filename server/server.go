@@ -959,18 +959,21 @@ func (s *Server) handleSiteMedia(site *Site, kindDir, relPath string, w http.Res
 		return
 	}
 
-	if m, ok := site.store.GetRAMByID(postID); ok {
-		if m.Hidden {
+	m, ok := site.store.GetRAMByID(postID)
+	if !ok || m.Hidden {
+		http.NotFound(w, r)
+		return
+	}
+	if !m.IsPublic {
+		auth, loggedIn := site.Authenticate(r)
+		if !loggedIn || auth.EffectiveUser != m.Author {
 			http.NotFound(w, r)
 			return
 		}
-		if !m.IsPublic {
-			auth, loggedIn := site.Authenticate(r)
-			if !loggedIn || auth.EffectiveUser != m.Author {
-				http.NotFound(w, r)
-				return
-			}
-		}
+		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+		w.Header().Set("Pragma", "no-cache")
+	} else {
+		w.Header().Set("Cache-Control", "no-cache")
 	}
 
 	mediaPath := filepath.Join(site.dir, kindDir, strconv.FormatInt(postID, 10), fileName)
@@ -2500,7 +2503,7 @@ const indexHTML = `<!DOCTYPE html>
       <form id="compose-form" style="display: none;" method="POST" action="{{.BasePath}}/post" enctype="multipart/form-data" onsubmit="return prepareSubmit(event)">
         <input type="hidden" id="edit-id-input" name="edit_id" value="">
         <input type="hidden" id="flavor-input" name="flavor" value="log">
-        <input type="hidden" id="format-input" name="format" value="text">
+        <input type="hidden" id="format-input" name="format" value="html">
         <input type="hidden" id="existing-images-input" name="existing_images" value="">
         <input type="hidden" id="existing-attachments-input" name="existing_attachments" value="">
         <div class="compose-header-row">
@@ -2526,12 +2529,12 @@ const indexHTML = `<!DOCTYPE html>
           <div id="existing-attachments-note" style="display: none; margin-top: 0.35rem; font-size: 0.78rem; color: var(--accent);"></div>
         </div>
         <div class="editor-tabs">
-          <button type="button" id="tab-text" class="editor-tab active" onclick="setEditorMode('text')">Plain Text</button>
+          <button type="button" id="tab-html" class="editor-tab active" onclick="setEditorMode('html')">Rich Text (Quill)</button>
           <button type="button" id="tab-markdown" class="editor-tab" onclick="setEditorMode('markdown')">Markdown</button>
-          <button type="button" id="tab-html" class="editor-tab" onclick="setEditorMode('html')">Rich Text (Quill)</button>
+          <button type="button" id="tab-text" class="editor-tab" onclick="setEditorMode('text')">Plain Text</button>
         </div>
-        <textarea id="content-input" name="content" rows="4" placeholder="{{if .IsCrypto}}Write a public post or end-to-end encrypted private note...{{else}}Write a public post or private note...{{end}}"></textarea>
-        <div id="quill-wrapper" style="display: none;">
+        <textarea id="content-input" name="content" rows="4" style="display: none;" placeholder="{{if .IsCrypto}}Write a public post or end-to-end encrypted private note...{{else}}Write a public post or private note...{{end}}"></textarea>
+        <div id="quill-wrapper" style="display: block;">
           <div id="quill-editor"></div>
         </div>
         <div class="compose-footer">
@@ -2680,7 +2683,7 @@ const indexHTML = `<!DOCTYPE html>
   {{if .LoggedIn}}<script src="/static/quill.js"></script>{{end}}
   <script>
     var quillInstance = null;
-    var currentMode = 'text';
+    var currentMode = 'html';
     var currentFlavor = 'log';
 
     function closeAllDropdowns(exceptEl) {
@@ -2784,6 +2787,9 @@ const indexHTML = `<!DOCTYPE html>
       applyFlavorUI(flavor);
       document.getElementById('flavor-chooser').style.display = 'none';
       document.getElementById('compose-form').style.display = 'block';
+      if (currentMode === 'html') {
+        initQuillIfNeeded();
+      }
       if (flavor === 'article' || flavor === 'gallery') {
         document.getElementById('title-input').focus();
       } else if (currentMode === 'html' && quillInstance) {
@@ -2847,6 +2853,7 @@ const indexHTML = `<!DOCTYPE html>
       document.getElementById('public1-input').checked = false;
       document.getElementById('public2-input').checked = false;
       document.getElementById('starred-input').checked = false;
+      setEditorMode('html');
       if (quillInstance) {
         quillInstance.setText('');
       }

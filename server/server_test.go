@@ -1452,5 +1452,56 @@ func TestPostingFlavorsStarredAndGallery(t *testing.T) {
 	if !strings.Contains(string(perm4Bytes), `src="/@yak.net/images/4/inline_1.png"`) {
 		t.Errorf("expected /@yak.net/4 to render src=\"/@yak.net/images/4/inline_1.png\", got:\n%s", string(perm4Bytes))
 	}
+
+	// 9. Edit article #4 to make it PRIVATE, and verify /@yak.net/images/4/inline_1.png is blocked for anon and kirk, but allowed for spock
+	makePrivForm := url.Values{
+		"edit_id": {"4"},
+		"flavor":  {"article"},
+		"title":   {"Illustrated Article (Classified)"},
+		"format":  {"html"},
+		"content": {`<p>Here is an inline photo: <img src="/@yak.net/images/4/inline_1.png"></p>`},
+	}
+	req, _ = http.NewRequest(http.MethodPost, baseURL+"/@yak.net/post", strings.NewReader(makePrivForm.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth("spock", "secret")
+	resp, err = client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("POST edit article #4 to private failed: err=%v status=%v", err, resp)
+	}
+	resp.Body.Close()
+
+	// Anonymous user trying to guess /@yak.net/images/4/inline_1.png must get 404
+	anonImgResp, err := client.Get(baseURL + "/@yak.net/images/4/inline_1.png")
+	if err != nil {
+		t.Fatalf("GET private image as anon failed: %v", err)
+	}
+	anonImgResp.Body.Close()
+	if anonImgResp.StatusCode != http.StatusNotFound {
+		t.Errorf("expected 404 Not Found for anonymous access to private post image, got %d", anonImgResp.StatusCode)
+	}
+
+	// Another user (kirk) trying to access spock's private post image must get 404
+	req, _ = http.NewRequest(http.MethodGet, baseURL+"/@yak.net/images/4/inline_1.png", nil)
+	req.SetBasicAuth("kirk", "secret")
+	kirkImgResp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("GET private image as kirk failed: %v", err)
+	}
+	kirkImgResp.Body.Close()
+	if kirkImgResp.StatusCode != http.StatusNotFound {
+		t.Errorf("expected 404 Not Found for kirk accessing spock's private post image, got %d", kirkImgResp.StatusCode)
+	}
+
+	// Author (spock) can still access their own private post image
+	req, _ = http.NewRequest(http.MethodGet, baseURL+"/@yak.net/images/4/inline_1.png", nil)
+	req.SetBasicAuth("spock", "secret")
+	spockImgResp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("GET private image as spock failed: %v", err)
+	}
+	spockImgResp.Body.Close()
+	if spockImgResp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 OK for author spock accessing own private post image, got %d", spockImgResp.StatusCode)
+	}
 }
 
